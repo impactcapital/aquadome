@@ -30,11 +30,16 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import uuid
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -138,24 +143,55 @@ class DClimatePublisher:
         wallet_address: str,
         wallet_private_key: str,
         base_url: str = "https://api.dclimate.net",
+        pinata_jwt: str | None = None,
+        w3s_token: str | None = None,
     ) -> None:
         self._api_key = api_key
         self._wallet_address = wallet_address
         self._wallet_private_key = wallet_private_key  # kept in env, never logged
         self._base_url = base_url.rstrip("/")
+        self._pinata_jwt = pinata_jwt
+        self._w3s_token = w3s_token
 
     def upload_to_ipfs(self, parquet_path: Path) -> str:
         """
-        Upload GeoParquet file to IPFS via web3.storage or nft.storage.
+        Upload GeoParquet file to IPFS via Pinata or web3.storage.
         Returns IPFS CID (content identifier).
 
-        Both web3.storage and nft.storage are free up to 5GB (Filecoin-backed).
+        Pinata is tried first if pinata_jwt is provided; falls back to
+        web3.storage if w3s_token is provided instead.
+        Both services are free up to their respective limits.
         """
-        _ = parquet_path
-        raise NotImplementedError(
-            "Wire to web3.storage API: POST https://api.web3.storage/upload "
-            "with Authorization: Bearer {token}"
-        )
+        if self._pinata_jwt is None and self._w3s_token is None:
+            raise ValueError("Provide pinata_jwt or w3s_token for IPFS upload")
+
+        if self._pinata_jwt is not None:
+            with open(parquet_path, "rb") as fh:
+                response = httpx.post(
+                    "https://api.pinata.cloud/pinning/pinFileToIPFS",
+                    headers={"Authorization": f"Bearer {self._pinata_jwt}"},
+                    files={"file": (parquet_path.name, fh, "application/octet-stream")},
+                    timeout=120,
+                )
+            if response.status_code not in (200, 201):
+                raise RuntimeError(
+                    f"Pinata upload failed: {response.status_code} {response.text[:200]}"
+                )
+            return response.json()["IpfsHash"]
+
+        # Fall back to web3.storage
+        with open(parquet_path, "rb") as fh:
+            response = httpx.post(
+                "https://api.web3.storage/upload",
+                headers={"Authorization": f"Bearer {self._w3s_token}"},
+                content=fh.read(),
+                timeout=120,
+            )
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"web3.storage upload failed: {response.status_code} {response.text[:200]}"
+            )
+        return response.json()["cid"]
 
     def register_series(
         self,
@@ -168,8 +204,41 @@ class DClimatePublisher:
         Registers a new dataset series with dClimate's on-chain registry.
         Returns DClimatePublishResult.
         """
-        _ = metadata, ipfs_cid, record_count
-        raise NotImplementedError("Wire to dClimate API: POST {base}/apiv4/register_dataset")
+        response = httpx.post(
+            f"{self._base_url}/apiv4/register_dataset",
+            headers={
+                "Authorization": f"Bearer {self._api_key}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "dataset_id": metadata.series_id,
+                "name": metadata.name,
+                "description": metadata.description,
+                "unit": metadata.unit,
+                "spatial_resolution": metadata.spatial_resolution,
+                "temporal_resolution": metadata.temporal_resolution,
+                "bbox": list(metadata.bbox),
+                "tags": metadata.tags,
+                "license": metadata.license,
+                "publisher": metadata.publisher,
+                "ipfs_cid": ipfs_cid,
+                "record_count": record_count,
+            },
+            timeout=60,
+        )
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"dClimate register_dataset failed: {response.status_code} {response.text[:200]}"
+            )
+        data = response.json()
+        return DClimatePublishResult(
+            series_id=metadata.series_id,
+            ipfs_cid=ipfs_cid,
+            polygon_tx_hash=data.get("tx_hash", ""),
+            dataset_url=f"{self._base_url}/apiv4/get_station_json/{metadata.series_id}",
+            published_at=datetime.now(timezone.utc),
+            record_count=record_count,
+        )
 
     def append_data(
         self,
@@ -185,8 +254,30 @@ class DClimatePublisher:
         AkuaDome publishes after each flight pass — dClimate consumers
         receive near-real-time waterway compliance updates.
         """
-        _ = series_id, parquet_path, flight_id, captured_at
-        raise NotImplementedError("Wire to dClimate API: POST {base}/apiv4/append_data/{id}")
+        with open(parquet_path, "rb") as fh:
+            response = httpx.post(
+                f"{self._base_url}/apiv4/append_data/{series_id}",
+                headers={"Authorization": f"Bearer {self._api_key}"},
+                files={"file": (parquet_path.name, fh, "application/octet-stream")},
+                data={
+                    "flight_id": str(flight_id),
+                    "captured_at": captured_at.isoformat(),
+                },
+                timeout=120,
+            )
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"dClimate append_data failed: {response.status_code} {response.text[:200]}"
+            )
+        data = response.json()
+        return DClimatePublishResult(
+            series_id=series_id,
+            ipfs_cid=data.get("ipfs_cid", ""),
+            polygon_tx_hash=data.get("tx_hash", ""),
+            dataset_url=f"{self._base_url}/apiv4/get_station_json/{series_id}",
+            published_at=datetime.now(timezone.utc),
+            record_count=data.get("record_count", 0),
+        )
 
     def publish_flight_to_all_series(
         self,
@@ -200,10 +291,26 @@ class DClimatePublisher:
         Publish all three AkuaDome series in one flight-completion call.
         Returns {series_key: result} for all three series.
         """
-        _ = dwell_parquet, at_risk_parquet, change_parquet, flight_id, captured_at
-        raise NotImplementedError("Wire append_data calls for all three series")
+        parquet_by_key = {
+            "dwell": dwell_parquet,
+            "at_risk": at_risk_parquet,
+            "change_detection": change_parquet,
+        }
+        results: dict[str, DClimatePublishResult] = {}
+        for key, meta in AQUADOME_SERIES.items():
+            parquet = parquet_by_key[key]
+            results[key] = self.append_data(meta.series_id, parquet, flight_id, captured_at)
+        return results
 
     def get_subscriber_count(self, series_id: str) -> int:
         """GET /apiv4/dataset/{series_id}/stats — total subscriber count."""
-        _ = series_id
-        raise NotImplementedError("Wire to dClimate API: GET {base}/apiv4/dataset/{id}/stats")
+        response = httpx.get(
+            f"{self._base_url}/apiv4/dataset/{series_id}/stats",
+            headers={"Authorization": f"Bearer {self._api_key}"},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"dClimate stats failed: {response.status_code} {response.text[:200]}"
+            )
+        return int(response.json().get("subscriber_count", 0))
