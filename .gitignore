@@ -1,0 +1,48 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+.env
+.env.local
+
+# ML artifacts
+*.onnx
+*.pt
+*.pth
+*.pkl
+*.bin
+models/
+
+# Data (raw drone footage stays out of git)
+data/raw/
+data/processed/
+data/labels/
+
+# Imagery
+*.tif
+*.tiff
+*.jpg
+*.jpeg
+*.png
+*.mp4
+*.mov
+
+# DB
+*.sqlite
+*.db
+
+# Pytest / coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Ruff
+.ruff_cache/
+
+# MyPy
+.mypy_cache/
+
+# OS
+.DS_Store

@@ -1,0 +1,25 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    environment:
+      POSTGRES_DB: aquadome
+      POSTGRES_USER: aquadome
+      POSTGRES_PASSWORD: aquadome
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  api:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.api
+    depends_on:
+      - db
+    environment:
+      AQUADOME_DATABASE_URL: postgresql+asyncpg://aquadome:aquadome@db:5432/aquadome
+    ports:
+      - "8000:8000"
+
+volumes:
+  pgdata:

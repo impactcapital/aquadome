@@ -1,0 +1,1 @@
+"""Drone platform telemetry adapters."""

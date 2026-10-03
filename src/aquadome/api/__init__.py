@@ -1,0 +1,1 @@
+"""AquaDome FastAPI application."""
