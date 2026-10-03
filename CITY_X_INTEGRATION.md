@@ -207,16 +207,19 @@ Every City-X.ai product publishes to:
 
 ## Action Items
 
-| Priority | Action | Owner | Timeline |
-|----------|--------|-------|----------|
-| 🔴 Now | Register `city-x.ai` domain | Silvio | This week |
-| 🔴 Now | Apply EPN Startup tier | SustainaCities LLC | 2 weeks |
-| 🟡 Phase 1 | Wire `arcgis_online.py` → AGOL API (OAuth + Feature Service) | Dev | Month 1 |
+| Priority | Action | Owner | Status |
+|----------|--------|-------|--------|
+| ✅ Done | Register `city-x.ai` domain (GoDaddy) | Silvio | **DONE — Oct 2026** |
+| ✅ Done | Wire all marketplace + spatial HTTP clients | Dev | **DONE — aquadome PR #1** |
+| 🔴 Now | Apply EPN Startup tier at esri.com/partners | SustainaCities LLC | 2 weeks |
+| 🔴 Now | Point `city-x.ai` DNS → SustainaCities landing (GoDaddy → Netlify/Vercel) | Silvio | This week |
 | 🟡 Phase 1 | Close Marine Patrol + FWC government contracts | Silvio | Month 1–2 |
-| 🟡 Phase 1 | Register `aquadome.waterway.dwell.miami` on dClimate | Dev | Month 1 |
-| 🟡 Phase 1 | Publish first Ocean Protocol datatoken (dwell GeoParquet) | Dev | Month 2 |
+| 🟡 Phase 1 | Register `aquadome.waterway.dwell.miami` on dClimate (set AQUADOME_DCLIMATE_API_KEY) | Dev | Month 1 |
+| 🟡 Phase 1 | Publish first Ocean Protocol datatoken (dwell GeoParquet, set Polygon wallet) | Dev | Month 2 |
+| 🟡 Phase 1 | Set AQUADOME_AGOL_CLIENT_ID + AQUADOME_AGOL_CLIENT_SECRET in env | Dev | Month 1 |
+| 🟡 Phase 1 | Set AQUADOME_MIAMIVERSE_WEBHOOK_URL in env | Dev/Silvio | Month 1 |
 | 🟢 Phase 2 | Submit ArcGIS Marketplace listing (data + dashboard template) | Dev + Silvio | Month 3 |
-| 🟢 Phase 2 | Wire `aggregator.py` → full pipeline (Celery task) | Dev | Month 2–3 |
+| 🟢 Phase 2 | Wire `aggregator.py` distribution → Celery task | Dev | Month 2–3 |
 | 🟢 Phase 2 | MiamiVerse partnership — DataHub STAC webhook integration | Silvio | Month 3–4 |
 | 🔵 Phase 3 | Esri co-marketing campaign ("Compliance Intelligence for Smart Cities") | Silvio | Month 6 |
 | 🔵 Phase 3 | City-X.ai Mobility product scoping | Silvio | Month 6–12 |
