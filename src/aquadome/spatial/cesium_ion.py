@@ -24,6 +24,8 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+import httpx
+
 
 # Cesium ion imagery type strings
 IMAGERY_TYPE_DRONE_PHOTOS = "IMAGERY"
@@ -73,8 +75,24 @@ class CesiumIonUploader:
         options: e.g. {"baseTerrainId": 1} to drape over Cesium World Terrain
         Returns CesiumIonAsset with asset_id.
         """
-        _ = name, description, source_type, options
-        raise NotImplementedError("Wire to httpx.Client: POST {base}/v1/assets")
+        payload: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "type": "3DTILES",
+            "options": {
+                "sourceType": source_type,
+                **(options or {}),
+            },
+        }
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.post(f"{self._BASE}/v1/assets", json=payload)
+            r.raise_for_status()
+            response = r.json()
+        return CesiumIonAsset(
+            asset_id=response["id"],
+            name=response["name"],
+            status=response["status"],
+        )
 
     def upload_files(self, asset_id: int, imagery_dir: Path) -> None:
         """
@@ -82,20 +100,51 @@ class CesiumIonUploader:
         Supports JPEG, TIFF (GeoTIFF), and PNG.
         Files > 100 MB use multipart upload.
         """
-        _ = asset_id, imagery_dir
-        raise NotImplementedError("Wire to httpx.Client: POST {base}/v1/assets/{id}/uploadFiles")
+        # Get upload location from asset details
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            asset_resp = client.get(f"{self._BASE}/v1/assets/{asset_id}")
+            asset_resp.raise_for_status()
+            asset_data = asset_resp.json()
+
+        upload_location = asset_data.get("uploadLocation", {})
+        endpoint = upload_location.get("endpoint", "")
+        prefix = upload_location.get("prefix", "")
+
+        # Upload each image file
+        image_files = (
+            list(imagery_dir.glob("*.jpg"))
+            + list(imagery_dir.glob("*.tiff"))
+            + list(imagery_dir.glob("*.tif"))
+            + list(imagery_dir.glob("*.png"))
+            + list(imagery_dir.glob("*.JPG"))
+            + list(imagery_dir.glob("*.TIFF"))
+        )
+
+        for img_path in image_files:
+            with httpx.Client(timeout=300) as client:  # long timeout for large files
+                with open(img_path, "rb") as f:
+                    key = f"{prefix}{img_path.name}"
+                    # S3 PUT upload (no auth needed — presigned key in prefix)
+                    resp = client.put(f"{endpoint}/{key}", content=f.read())
+                    resp.raise_for_status()
 
     def signal_upload_complete(self, asset_id: int) -> None:
         """POST /v1/assets/{id}/uploadComplete — starts the tiling job."""
-        _ = asset_id
-        raise NotImplementedError(
-            "Wire to httpx.Client: POST {base}/v1/assets/{id}/uploadComplete"
-        )
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.post(f"{self._BASE}/v1/assets/{asset_id}/uploadComplete")
+            r.raise_for_status()
 
     def get_asset_status(self, asset_id: int) -> CesiumIonAsset:
         """GET /v1/assets/{id} — returns current tiling status."""
-        _ = asset_id
-        raise NotImplementedError("Wire to httpx.Client: GET {base}/v1/assets/{id}")
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.get(f"{self._BASE}/v1/assets/{asset_id}")
+            r.raise_for_status()
+            data = r.json()
+        return CesiumIonAsset(
+            asset_id=data["id"],
+            name=data["name"],
+            status=data["status"],
+        )
 
     def get_tileset_url(self, asset_id: int) -> str:
         """
@@ -103,8 +152,11 @@ class CesiumIonUploader:
         Returns the Cesium ion tileset URL for use in CesiumJS:
           ion://assets/{id}  or  https://assets.cesium.com/{id}/tileset.json
         """
-        _ = asset_id
-        raise NotImplementedError("Wire to httpx.Client: GET {base}/v1/assets/{id}/endpoint")
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.get(f"{self._BASE}/v1/assets/{asset_id}/endpoint")
+            r.raise_for_status()
+            response = r.json()
+        return response["url"]
 
     def wait_for_tileset(
         self,
@@ -133,5 +185,21 @@ class CesiumIonUploader:
         into Cesium ion as a 3D Tiles asset for MiamiVerse delivery.
         POST /v1/assets with type=3DTILES and sourceUrl pointing to the glTF.
         """
-        _ = splat_url, name, flight_id
-        raise NotImplementedError("Wire to httpx.Client: POST {base}/v1/assets (3DTILES ingest)")
+        payload: dict[str, Any] = {
+            "name": name,
+            "description": f"3DGS splat import for AquaDome flight {flight_id}",
+            "type": "3DTILES",
+            "options": {
+                "sourceType": "URL",
+                "url": splat_url,
+            },
+        }
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.post(f"{self._BASE}/v1/assets", json=payload)
+            r.raise_for_status()
+            response = r.json()
+        return CesiumIonAsset(
+            asset_id=response["id"],
+            name=response["name"],
+            status=response["status"],
+        )

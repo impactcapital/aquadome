@@ -37,10 +37,17 @@ Usage:
 
 from __future__ import annotations
 
+import hashlib
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import uuid
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -133,11 +140,15 @@ class OceanDataPublisher:
         publisher_wallet: Any,  # eth_account.Account
         aquadome_tenant_id: str,
         network: str = "polygon",
+        aquarius_url: str = "https://v4.aquarius.oceanprotocol.com",
+        provider_url: str = "https://v4.provider.oceanprotocol.com",
     ) -> None:
         self._ocean = ocean
         self._wallet = publisher_wallet
         self._tenant_id = aquadome_tenant_id
         self._network = network
+        self._aquarius_url = aquarius_url.rstrip("/")
+        self._provider_url = provider_url.rstrip("/")
 
     def publish_geoparquet(
         self,
@@ -154,27 +165,105 @@ class OceanDataPublisher:
         compute_to_data: if True, wraps in C2D pool (sensitive records)
 
         Returns OceanDataset with DID and datatoken address.
+
+        Note: On-chain NFT mint and datatoken creation requires web3.py + funded
+        Polygon wallet. This method handles DDO pre-registration; call
+        ocean-lib's ocean.assets.create() for the full on-chain flow.
         """
-        _ = dataset_type, parquet_path, flight_id, price_ocean, compute_to_data
-        raise NotImplementedError(
-            "Wire ocean-lib: ocean.assets.create(metadata, publisher_wallet, "
-            "files=[UrlFile(url=...)], data_token_amount=1.0)"
+        did = f"did:op:{hashlib.sha256(f'{dataset_type}:{flight_id}'.encode()).hexdigest()}"
+        metadata = DATASET_METADATA.get(dataset_type, DATASET_METADATA["dwell"])
+        now_iso = datetime.now(timezone.utc).isoformat()
+        ddo = {
+            "@context": ["https://w3id.org/did/v1"],
+            "id": did,
+            "version": "4.1.0",
+            "chainId": 137,  # Polygon mainnet
+            "nftAddress": "",  # populated after on-chain mint
+            "metadata": {
+                "created": now_iso,
+                "updated": now_iso,
+                "type": "dataset",
+                **metadata,
+                "additionalInformation": {
+                    "aquadome_flight_id": str(flight_id),
+                    "aquadome_dataset_type": dataset_type,
+                    "compute_to_data": compute_to_data,
+                    "network": self._network,
+                },
+            },
+            "services": [{
+                "id": "downloadService",
+                "type": "access" if not compute_to_data else "compute",
+                "files": "",  # encrypted by Provider
+                "datatokenAddress": "",  # populated after on-chain mint
+                "serviceEndpoint": self._provider_url,
+                "timeout": 0,
+            }],
+        }
+        response = httpx.post(
+            f"{self._aquarius_url}/api/aquarius/assets/ddo",
+            json=ddo,
+            timeout=30,
+        )
+        if response.status_code not in (200, 201):
+            raise RuntimeError(
+                f"Aquarius DDO registration failed: {response.status_code} {response.text[:200]}"
+            )
+        datatoken_symbol = f"AQUA-{dataset_type.upper()[:5]}-{str(flight_id)[:4].upper()}"
+        return OceanDataset(
+            did=did,
+            datatoken_address="",  # populated after on-chain NFT mint (requires web3.py)
+            datatoken_symbol=datatoken_symbol,
+            price_ocean=price_ocean,
+            metadata_url=f"{self._aquarius_url}/api/aquarius/assets/ddo/{did}",
+            aquadome_flight_id=flight_id,
+            dataset_type=dataset_type,
         )
 
     def get_asset_url(self, did: str, consumer_wallet: Any) -> str:
         """
         Consumer flow: purchase 1.0 datatoken → get signed download URL.
-        ocean.assets.download_asset(did, consumer_wallet, destination=...)
+        Fetches the DDO from Aquarius to confirm the asset exists, then
+        returns the Provider access endpoint for the given DID.
         """
-        _ = did, consumer_wallet
-        raise NotImplementedError("Wire ocean-lib: ocean.assets.download_asset()")
+        response = httpx.get(
+            f"{self._aquarius_url}/api/aquarius/assets/ddo/{did}",
+            timeout=30,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"Asset {did} not found in Aquarius: {response.status_code}"
+            )
+        return f"{self._provider_url}/api/services/download?did={did}"
 
     def list_published_assets(self) -> list[OceanDataset]:
         """
         Query Aquarius (Ocean metadata cache) for all assets published
         by this tenant.
         """
-        raise NotImplementedError("Wire ocean-lib: ocean.assets.search()")
+        response = httpx.get(
+            f"{self._aquarius_url}/api/aquarius/assets/query",
+            params={"q": f"aquadome_tenant_id:{self._tenant_id}", "size": 100},
+            timeout=30,
+        )
+        if response.status_code != 200:
+            logger.warning(
+                "Aquarius assets/query failed: %s %s",
+                response.status_code,
+                response.text[:200],
+            )
+            return []
+        hits = response.json().get("hits", {}).get("hits", [])
+        return [
+            OceanDataset(
+                did=h["_id"],
+                datatoken_address=h["_source"].get("nftAddress", ""),
+                datatoken_symbol=h["_source"]["metadata"].get("name", "")[:20],
+                price_ocean=1.0,
+                metadata_url=f"{self._aquarius_url}/api/aquarius/assets/ddo/{h['_id']}",
+            )
+            for h in hits
+        ]
 
     # -------------------------------------------------------------------------
     # DePIN token economics (future)

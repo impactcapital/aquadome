@@ -20,9 +20,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 import uuid
+
+import httpx
 
 
 @dataclass
@@ -91,12 +94,49 @@ class SpexiClient:
         Real implementation: multipart POST to /v1/captures
         with imagery files + GCP CSV + metadata JSON.
         """
-        # Placeholder — wire to httpx or requests in production
-        _ = imagery_dir, gcps, metadata
-        raise NotImplementedError(
-            "Wire to httpx.Client: POST {base}/v1/captures "
-            "with Authorization: Bearer {api_key}"
+        # Step 1: Create capture record
+        capture_payload: dict[str, Any] = {
+            "flight_id": str(metadata.flight_id),
+            "tenant_id": metadata.tenant_id,
+            "hardware_tier": metadata.hardware_tier,
+            "capture_datetime_utc": metadata.capture_datetime_utc,
+            "mission_type": metadata.mission_type,
+            "disaster_response": metadata.disaster_response,
+            "area_of_interest": metadata.area_of_interest,
+        }
+        with httpx.Client(headers=self._headers(), timeout=60) as client:
+            r = client.post(f"{self._base_url}/v1/captures", json=capture_payload)
+            if r.status_code not in (200, 201):
+                raise RuntimeError(f"Spexi capture creation failed: {r.status_code} {r.text[:200]}")
+            capture_id = r.json()["capture_id"]
+
+        # Step 2: Build GCP CSV
+        gcp_lines = ["label,lon,lat,alt_m,pixel_x,pixel_y,image_filename"]
+        for g in gcps:
+            gcp_lines.append(
+                f"{g.label},{g.lon},{g.lat},{g.alt_m},{g.pixel_x},{g.pixel_y},{g.image_filename}"
+            )
+        gcp_csv = "\n".join(gcp_lines).encode()
+
+        # Step 3: Upload imagery files + GCPs in multipart
+        image_files = (
+            list(imagery_dir.glob("*.jpg"))
+            + list(imagery_dir.glob("*.JPG"))
+            + list(imagery_dir.glob("*.tiff"))
+            + list(imagery_dir.glob("*.TIFF"))
         )
+
+        with httpx.Client(
+            headers={"Authorization": f"Bearer {self._api_key}"}, timeout=600
+        ) as client:
+            files: list[Any] = [("gcps", ("gcps.csv", BytesIO(gcp_csv), "text/csv"))]
+            for img in image_files[:50]:  # Spexi accepts up to 50 images per batch
+                files.append(("images", (img.name, open(img, "rb"), "image/jpeg")))
+            r = client.post(f"{self._base_url}/v1/captures/{capture_id}/upload", files=files)
+            if r.status_code not in (200, 201, 202):
+                raise RuntimeError(f"Spexi upload failed: {r.status_code} {r.text[:200]}")
+
+        return capture_id
 
     def get_reconstruction_status(self, capture_id: str) -> SpexiReconstructionStatus:
         """
@@ -104,8 +144,20 @@ class SpexiClient:
         GET /v1/captures/{capture_id}/status
         Returns SpexiReconstructionStatus.
         """
-        _ = capture_id
-        raise NotImplementedError("Wire to httpx.Client: GET {base}/v1/captures/{id}/status")
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.get(f"{self._base_url}/v1/captures/{capture_id}/status")
+            if r.status_code != 200:
+                raise RuntimeError(f"Spexi status failed: {r.status_code} {r.text[:200]}")
+            data = r.json()
+        return SpexiReconstructionStatus(
+            capture_id=data["capture_id"],
+            status=data["status"],
+            progress_pct=float(data.get("progress_pct", 0.0)),
+            asset_url=data.get("asset_url"),
+            vps_map_id=data.get("vps_map_id"),
+            tileset_url=data.get("tileset_url"),
+            error_message=data.get("error_message"),
+        )
 
     def poll_until_complete(
         self,
@@ -138,5 +190,14 @@ class SpexiClient:
         GET /v1/captures?bbox=...&limit=...
         Returns GeoJSON FeatureCollection items.
         """
-        _ = bbox, tenant_id, limit
-        raise NotImplementedError("Wire to httpx.Client: GET {base}/v1/captures")
+        params: dict[str, Any] = {"limit": limit, "f": "json"}
+        if bbox:
+            params["bbox"] = f"{bbox[0]},{bbox[1]},{bbox[2]},{bbox[3]}"
+        if tenant_id:
+            params["tenant_id"] = tenant_id
+
+        with httpx.Client(headers=self._headers(), timeout=30) as client:
+            r = client.get(f"{self._base_url}/v1/captures", params=params)
+            if r.status_code != 200:
+                raise RuntimeError(f"Spexi list_captures failed: {r.status_code} {r.text[:200]}")
+            return r.json().get("features", [])

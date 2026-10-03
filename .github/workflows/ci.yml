@@ -15,9 +15,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install ruff mypy pydantic
+      - run: pip install ruff mypy pydantic pydantic-settings
       - run: ruff check src/ tests/
       - run: ruff format --check src/ tests/
+      - name: mypy type check
+        run: mypy src/ --ignore-missing-imports
 
   test:
     name: Unit Tests
@@ -28,7 +30,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -e ".[dev]"
-      - run: pytest tests/unit/ -v --tb=short
+      - run: pytest tests/unit/ -v --tb=short --no-header
 
   license-check:
     name: License Policy Enforcement
@@ -40,7 +42,18 @@ jobs:
           python-version: "3.11"
       - run: pip install pip-licenses
       - run: pip install -e ".[dev]"
-      - name: Block AGPL / GPL / non-commercial licenses
+      - name: Block AGPL / GPL / LGPL / SSPL / non-commercial licenses
         run: |
           pip-licenses --format=json --output-file=licenses.json
           python scripts/check_licenses.py licenses.json
+
+  security-scan:
+    name: Security Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pip-audit
+      - run: pip-audit --skip-editable -r requirements-audit.txt || true  # advisory only

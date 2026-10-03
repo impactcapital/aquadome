@@ -22,13 +22,20 @@ Usage:
 
 from __future__ import annotations
 
+import json
+import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 import uuid
 
+import httpx
+
 from ..ontology.models import Entity
 from ..ontology.enums import DwellStatus, AtRiskTier, TrapLegalStatus
 
+
+logger = logging.getLogger(__name__)
 
 # AGOL item type for a hosted feature layer
 AGOL_FEATURE_SERVICE_TYPE = "Feature Service"
@@ -58,21 +65,83 @@ class AGOLPublisher:
       4. share_item(item_id, token)   — make public or share with specific groups
     """
 
-    def __init__(self, client_id: str, client_secret: str, org_url: str) -> None:
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        org_url: str,
+        username: str | None = None,
+    ) -> None:
         self._client_id = client_id
         self._client_secret = client_secret
         self._org_url = org_url.rstrip("/")
         self._rest_url = f"{self._org_url}/sharing/rest"
+        self._username = username
+        self._token_cache: str | None = None
+        self._token_expires_at: float = 0.0
+
+    # -------------------------------------------------------------------------
+    # Internal helpers
+    # -------------------------------------------------------------------------
+
+    def _get_valid_token(self) -> str:
+        """Return cached token if still valid, otherwise fetch a fresh one."""
+        if self._token_cache is not None and time.time() < self._token_expires_at:
+            return self._token_cache
+        return self.get_token()
+
+    def _get_username(self, token: str) -> str:
+        """Return stored username, or fetch it from /community/self."""
+        if self._username:
+            return self._username
+        with httpx.Client() as client:
+            response = client.get(
+                f"{self._rest_url}/community/self",
+                params={"token": token, "f": "json"},
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AGOL API error {response.status_code}: {response.text[:200]}"
+            )
+        data = response.json()
+        self._username = data["username"]
+        return self._username
+
+    # -------------------------------------------------------------------------
+    # Auth
+    # -------------------------------------------------------------------------
 
     def get_token(self) -> str:
         """
         POST /sharing/rest/oauth2/token
         Returns short-lived access token for AGOL REST calls.
         """
-        raise NotImplementedError(
-            "Wire to httpx.Client: POST {rest}/oauth2/token "
-            "with grant_type=client_credentials"
-        )
+        with httpx.Client() as client:
+            response = client.post(
+                f"{self._rest_url}/oauth2/token",
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self._client_id,
+                    "client_secret": self._client_secret,
+                    "f": "json",
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AGOL API error {response.status_code}: {response.text[:200]}"
+            )
+        data = response.json()
+        token: str = data["access_token"]
+        expires_in: int = data.get("expires_in", 7200)
+        self._token_cache = token
+        # Subtract a small buffer so we refresh before actual expiry
+        self._token_expires_at = time.time() + expires_in - 30
+        return token
+
+    # -------------------------------------------------------------------------
+    # GeoJSON conversion
+    # -------------------------------------------------------------------------
 
     def entities_to_geojson(
         self,
@@ -121,6 +190,10 @@ class AGOLPublisher:
             })
         return {"type": "FeatureCollection", "features": features}
 
+    # -------------------------------------------------------------------------
+    # Item management
+    # -------------------------------------------------------------------------
+
     def add_item(
         self,
         geojson: dict[str, Any],
@@ -133,10 +206,26 @@ class AGOLPublisher:
         Uploads GeoJSON as an AGOL item (type=GeoJson).
         Returns item_id.
         """
-        _ = geojson, title, token, tags
-        raise NotImplementedError(
-            "Wire to httpx.Client: POST {rest}/content/users/{user}/addItem"
-        )
+        username = self._get_username(token)
+        tag_str = ",".join(tags) if tags else "AquaDome,waterway,compliance"
+        with httpx.Client() as client:
+            response = client.post(
+                f"{self._rest_url}/content/users/{username}/addItem",
+                data={
+                    "title": title,
+                    "type": AGOL_GEOJSON_TYPE,
+                    "tags": tag_str,
+                    "text": json.dumps(geojson),
+                    "f": "json",
+                    "token": token,
+                },
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AGOL API error {response.status_code}: {response.text[:200]}"
+            )
+        data = response.json()
+        return data["id"]
 
     def publish_item(self, item_id: str, token: str, service_name: str) -> str:
         """
@@ -144,10 +233,26 @@ class AGOLPublisher:
         Converts GeoJSON item → hosted Feature Service.
         Returns new service item_id.
         """
-        _ = item_id, token, service_name
-        raise NotImplementedError(
-            "Wire to httpx.Client: POST {rest}/content/users/{user}/publish"
-        )
+        username = self._get_username(token)
+        publish_params = json.dumps({"name": service_name, "hasStaticData": False})
+        with httpx.Client() as client:
+            response = client.post(
+                f"{self._rest_url}/content/users/{username}/publish",
+                data={
+                    "itemId": item_id,
+                    "filetype": "geojson",
+                    "publishParameters": publish_params,
+                    "f": "json",
+                    "token": token,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AGOL API error {response.status_code}: {response.text[:200]}"
+            )
+        data = response.json()
+        return data["services"][0]["serviceItemId"]
 
     def share_item(
         self,
@@ -160,10 +265,26 @@ class AGOLPublisher:
         POST /sharing/rest/content/users/{username}/items/{id}/share
         Share with org, specific groups, or public.
         """
-        _ = item_id, token, everyone, groups
-        raise NotImplementedError(
-            "Wire to httpx.Client: POST {rest}/content/users/{user}/items/{id}/share"
-        )
+        username = self._get_username(token)
+        with httpx.Client() as client:
+            response = client.post(
+                f"{self._rest_url}/content/users/{username}/items/{item_id}/share",
+                data={
+                    "everyone": "true" if everyone else "false",
+                    "groups": ",".join(groups) if groups else "",
+                    "f": "json",
+                    "token": token,
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+        if response.status_code != 200:
+            raise RuntimeError(
+                f"AGOL API error {response.status_code}: {response.text[:200]}"
+            )
+
+    # -------------------------------------------------------------------------
+    # Orchestration
+    # -------------------------------------------------------------------------
 
     def publish_entity_layer(
         self,
@@ -177,8 +298,36 @@ class AGOLPublisher:
         Full flow: GeoJSON → AGOL item → hosted Feature Service.
         Returns AGOLPublishResult with item_id and service_url.
         """
-        _ = entities, flight_id, token, title, public
-        raise NotImplementedError("Wire add_item → publish_item → share_item")
+        effective_title = title or f"AquaDome Compliance {flight_id}"
+        service_name = f"AquaDome_{str(flight_id)[:8]}"
+
+        # 1. Build GeoJSON from entities
+        geojson = self.entities_to_geojson(entities, flight_id)
+
+        # 2. Upload as AGOL item
+        item_id = self.add_item(geojson, effective_title, token)
+        logger.info("AGOL addItem succeeded: item_id=%s", item_id)
+
+        # 3. Publish GeoJSON item → hosted Feature Service
+        service_item_id = self.publish_item(item_id, token, service_name=service_name)
+        logger.info("AGOL publish succeeded: service_item_id=%s", service_item_id)
+
+        # 4. Share the service item
+        self.share_item(service_item_id, token, everyone=public)
+        logger.info("AGOL share succeeded: everyone=%s", public)
+
+        # 5. Build result URLs
+        service_url = f"{self._org_url}/rest/services/{service_name}/FeatureServer"
+        layer_url = service_url + "/0"
+        agol_item_url = f"{self._org_url}/home/item.html?id={service_item_id}"
+
+        return AGOLPublishResult(
+            item_id=service_item_id,
+            service_url=service_url,
+            layer_url=layer_url,
+            agol_item_url=agol_item_url,
+            flight_id=flight_id,
+        )
 
     # -------------------------------------------------------------------------
     # Marketplace listing helpers
@@ -204,5 +353,9 @@ class AGOLPublisher:
           $500/mo — per-tenant compliance dashboard (Marine Patrol, FWC, DERM)
           Custom  — insurance underwriting / AI training data bundles
         """
-        _ = item_id, token, price_usd, listing_title, listing_description
-        raise NotImplementedError("Wire to AGOL Marketplace API")
+        logger.warning(
+            "ArcGIS Marketplace listing requires EPN partnership — submit at "
+            "https://marketplace.arcgis.com/items/%s after EPN approval.",
+            item_id,
+        )
+        return item_id
