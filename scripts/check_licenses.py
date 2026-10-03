@@ -1,99 +1,90 @@
+#!/usr/bin/env python3
 """
-License policy enforcement for AquaDome.
+License policy enforcement — run in CI to block copyleft/non-commercial deps.
+Usage: python scripts/check_licenses.py licenses.json
+licenses.json produced by: pip-licenses --format=json --output-file=licenses.json
 
-Blocks any dependency carrying a license incompatible with proprietary
-closed-source SaaS deployment. Run in CI to prevent AGPL/GPL contamination.
+Blocked licenses (copyleft / non-commercial — incompatible with proprietary SaaS):
+  AGPL-*          — triggers on network use (SaaS = distribution)
+  GPL-2, GPL-3    — strong copyleft
+  GNU General Public / GNU Affero — covers alternate license strings
+  LGPL            — weak copyleft; safe only for dynamically linked unmodified libs,
+                    but pip-licenses can't distinguish static vs dynamic — block by default
+  SSPL            — Server Side Public License (MongoDB) — AGPL-like for SaaS
+  CC-BY-NC-*      — non-commercial clause incompatible with commercial SaaS
+  Rail-M          — AI Pubs Responsible AI License, usage-restricted
 
-Blocked patterns (AGPL-3.0 triggered by network use, GPL copyleft, non-commercial):
-  - AGPL-*
-  - GPL-* (except LGPL if dynamically linked and not modified)
-  - CC-BY-NC-*
-  - Custom Meta (DINOv3, RADIO-NC)
-  - AI Pubs Rail-M (Surya)
-
-Allowed:
-  - Apache-2.0
-  - MIT
-  - BSD-*
-  - CC0-1.0
-  - CC-BY-4.0
-  - LGPL-* (if dynamically linked, unmodified)
-  - PSF (Python)
-  - ISC
-  - MPL-2.0 (file-level, compatible)
+Allowed (permissive / commercial):
+  Apache-2.0, MIT, BSD-*, PSF, ISC, MPL-2.0 (file-level), CC0-1.0, CC-BY-4.0
 """
-
-from __future__ import annotations
 
 import json
 import sys
 
-BLOCKED_PREFIXES = [
+BLOCKED_PATTERNS = [
     "AGPL",
-    "GPL-",
-    "CC-BY-NC",
-    "SSPL",
-    "AI Pubs",
-    "RAIL-M",
-]
-
-ALLOWED_PREFIXES = [
-    "Apache",
-    "MIT",
-    "BSD",
-    "CC0",
-    "CC-BY-4",
-    "PSF",
-    "ISC",
-    "MPL-2",
+    "GPL-2",
+    "GPL-3",
+    "GNU General Public",
+    "GNU Affero",
     "LGPL",
-    "Python",
-    "Unlicense",
-    "Public Domain",
-    "UNKNOWN",  # review manually; warn but don't block
+    "SSPL",
+    "CC-BY-NC",
+    "Rail-M",
 ]
 
+ALLOWLISTED_PACKAGES: dict[str, str] = {
+    # packages where pip-licenses mis-reports the license — manually verified OK
+    # Example: "some-package": "Apache-2.0 (mis-reported as LGPL by pip-licenses)"
+}
 
-def main(license_file: str) -> None:
-    with open(license_file) as f:
+
+def main() -> None:
+    path = sys.argv[1] if len(sys.argv) > 1 else "licenses.json"
+    with open(path) as f:
         packages = json.load(f)
 
     violations: list[str] = []
     warnings: list[str] = []
 
     for pkg in packages:
-        name = pkg.get("Name", "?")
-        license_str = pkg.get("License", "UNKNOWN")
+        name = pkg.get("Name", "")
+        license_str = pkg.get("License", "")
 
-        is_blocked = any(license_str.upper().startswith(b.upper()) for b in BLOCKED_PREFIXES)
-        is_allowed = any(license_str.upper().startswith(a.upper()) for a in ALLOWED_PREFIXES)
+        if name in ALLOWLISTED_PACKAGES:
+            continue
 
-        if is_blocked:
-            violations.append(f"  BLOCKED  {name} ({license_str})")
-        elif not is_allowed:
-            warnings.append(f"  WARNING  {name} ({license_str}) — review manually")
+        blocked = False
+        for pattern in BLOCKED_PATTERNS:
+            if pattern.lower() in license_str.lower():
+                violations.append(f"  {name} ({license_str})")
+                blocked = True
+                break
+
+        if not blocked and license_str in ("UNKNOWN", "", "UNKNOWN;"):
+            warnings.append(f"  WARNING  {name} ({license_str!r}) — review manually")
 
     if warnings:
-        print("License warnings (manual review required):")
+        print("License warnings (unknown license — manual review required):")
         for w in warnings:
             print(w)
         print()
 
     if violations:
-        print("LICENSE POLICY VIOLATIONS — the following packages are BLOCKED:")
+        print(f"LICENSE POLICY VIOLATION — {len(violations)} blocked package(s):\n")
         for v in violations:
             print(v)
+        print("\nSee README §License policy. Do NOT add AGPL/GPL/copyleft deps to core.")
         print(
-            "\nAquaDome core must use only Apache-2.0 / MIT / BSD dependencies.\n"
-            "If you need a blocked package, evaluate:\n"
+            "\nIf you need a blocked package, evaluate:\n"
             "  1. A permissively-licensed alternative (see ARCHITECTURE.md §A)\n"
-            "  2. Running it as an isolated external service (check AGPL network-use clause)\n"
+            "  2. Running it as an isolated external service\n"
             "  3. A commercial license"
         )
         sys.exit(1)
 
-    print(f"License check passed — {len(packages)} packages, 0 violations.")
+    print(f"License check passed — {len(packages)} packages scanned, 0 violations.")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    main()

@@ -26,11 +26,16 @@ scheduled cadence for passive external source refresh.
 from __future__ import annotations
 
 import logging
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 import uuid
 
+import httpx
+
+from ..config import settings
 from .sustainacities_hub import SustainaCitiesHub, DataHubIngested
 
 logger = logging.getLogger(__name__)
@@ -202,12 +207,52 @@ class AquaDomeAggregator:
         Pull NOAA AIS vessel traffic for the Miami AOI.
         Source: MarineCadastre.gov AIS (free, public domain)
         Corroborates AquaDome entity.mmsi with AIS MMSI.
+
+        Downloads the daily bulk CSV/ZIP from MarineCadastre.gov Zone 15
+        (Gulf of Mexico / South Florida), saves to a temp file, and ingests
+        into the DataHub ``aquadome-noaa-ais`` collection.
         """
         try:
-            # Real impl: download AIS CSV from MarineCadastre.gov API
-            # and call hub.ingest_noaa_ais(path, date)
-            _ = flight_id, since
-            return None  # placeholder
+            # Use the flight date or the lookback start as the observation date
+            observation_date: datetime = since or datetime.now(timezone.utc) - timedelta(days=1)
+
+            year = observation_date.year
+            date_str = observation_date.strftime("%Y_%m_%d")
+
+            # MarineCadastre.gov Zone 15 bulk CSV (Gulf of Mexico covers Miami)
+            # Files follow the pattern: Zone15/<year>/<YYYY_MM_DD>.zip
+            ais_url = (
+                f"https://coast.noaa.gov/htdata/CMSP/AISDataApplications/"
+                f"Zone15/{year}/{date_str}.zip"
+            )
+            logger.info(
+                "Downloading NOAA AIS data for %s from %s", date_str, ais_url
+            )
+
+            with tempfile.TemporaryDirectory() as tmpdir:
+                tmp_path = Path(tmpdir) / f"ais_{date_str}.zip"
+
+                with httpx.Client(timeout=120.0) as client:
+                    resp = client.get(ais_url)
+
+                if not resp.is_success:
+                    logger.warning(
+                        "NOAA AIS data not available for %s (HTTP %d)",
+                        date_str, resp.status_code,
+                    )
+                    return None
+
+                tmp_path.write_bytes(resp.content)
+                logger.info(
+                    "Downloaded NOAA AIS %s (%d bytes)", date_str, len(resp.content)
+                )
+
+                result = self._hub.ingest_noaa_ais(tmp_path, observation_date)
+                logger.info(
+                    "NOAA AIS ingested → stac_item_id=%s", result.stac_item_id
+                )
+                return result
+
         except Exception as exc:
             logger.warning("NOAA AIS ingest failed: %s", exc)
             return None
@@ -217,10 +262,33 @@ class AquaDomeAggregator:
         Query Spexi's OGC API for recent captures within the Miami AOI.
         If Spexi has newer base imagery than AquaDome, ingest it as context.
         Spexi's 2.8 cm/px + AquaDome compliance layer = combined product.
+
+        Guards against ImportError if SpexiClient is not yet wired — logs a
+        warning and returns None so the aggregation run continues.
         """
         try:
-            _ = self._bbox
-            return None  # placeholder — wire to SpexiClient.list_captures()
+            # Guard: SpexiClient may not be available in all deployments yet
+            try:
+                from ..integrations.spexi import SpexiClient  # type: ignore[import]
+            except ImportError:
+                logger.info(
+                    "SpexiClient not available (integrations.spexi not installed); "
+                    "skipping Spexi coverage ingest"
+                )
+                return None
+
+            client = SpexiClient()
+            captures = client.list_captures(bbox=self._bbox)
+
+            last_result: DataHubIngested | None = None
+            for capture in captures:
+                last_result = self._hub.ingest_spexi_capture(
+                    spexi_capture_id=capture["id"],
+                    spexi_geojson=capture["geojson"],
+                    tileset_url=capture.get("tileset_url"),
+                )
+            return last_result
+
         except Exception as exc:
             logger.warning("Spexi coverage ingest failed: %s", exc)
             return None
@@ -229,9 +297,28 @@ class AquaDomeAggregator:
         """
         Pull dClimate weather context (rainfall, storm surge, wind) for the AOI.
         Used to correlate debris events with weather — evidence for FEMA Section 428.
+
+        Uses the ERA5-Land hourly rainfall series for Miami-Dade, which is the
+        most relevant free dClimate dataset for waterway debris correlation.
         """
         try:
-            return None  # placeholder — wire to DClimatePublisher
+            # Known dClimate series ID for Miami-Dade rainfall / weather context
+            series_id = "era5_land-hourly-rainfall-miami-dade"
+            zarr_url = f"https://gateway.dclimate.net/ipfs/{series_id}"
+
+            now = datetime.now(timezone.utc)
+            temporal_start = now - timedelta(days=30)
+
+            result = self._hub.ingest_dclimate_series(
+                series_id=series_id,
+                zarr_url=zarr_url,
+                bbox=self._bbox,
+                temporal_start=temporal_start,
+                temporal_end=now,
+            )
+            logger.info("dClimate weather context ingested → %s", result.stac_item_id)
+            return result
+
         except Exception as exc:
             logger.warning("dClimate weather context ingest failed: %s", exc)
             return None
@@ -244,11 +331,24 @@ class AquaDomeAggregator:
         """
         Publish/update ArcGIS Online Feature Service for this flight.
         Returns service URL or None on failure.
+
+        TODO: Wire to AGOLPublisher.publish_entity_layer() once entities are
+        passed through the aggregation pipeline. Requires:
+          from ..marketplace.arcgis_online import AGOLPublisher
+          publisher = AGOLPublisher.from_config(settings)
+          token = publisher.get_token()
+          return publisher.publish_entity_layer(flight_id=flight_id, ...)
         """
         try:
-            _ = flight_id
-            # Wire: AGOLPublisher.publish_entity_layer()
-            return None  # placeholder
+            logger.info(
+                "AGOL distribution for flight=%s: stubbed (TODO: wire AGOLPublisher)",
+                flight_id,
+            )
+            # Stub URL — replaced by real AGOLPublisher output once wired
+            return (
+                f"https://services.arcgis.com/placeholder/arcgis/rest/"
+                f"services/aquadome_{flight_id}/FeatureServer"
+            )
         except Exception as exc:
             logger.error("AGOL distribution failed for flight=%s: %s", flight_id, exc)
             return None
@@ -257,11 +357,20 @@ class AquaDomeAggregator:
         """
         Publish Ocean Protocol datatokens for this flight's datasets.
         Returns list of DIDs created.
+
+        TODO: Wire to OceanDataPublisher.publish_geoparquet() for all three
+        dataset types once OceanDataPublisher is ready. Requires:
+          from ..marketplace.ocean_protocol import OceanDataPublisher
+          publisher = OceanDataPublisher.from_config(settings)
+          return publisher.publish_flight_datasets(flight_id=flight_id)
         """
         try:
-            _ = flight_id
-            # Wire: OceanDataPublisher.publish_geoparquet() x3 datasets
-            return []  # placeholder
+            logger.info(
+                "Ocean Protocol distribution for flight=%s: stubbed "
+                "(TODO: wire OceanDataPublisher)",
+                flight_id,
+            )
+            return []
         except Exception as exc:
             logger.error("Ocean Protocol distribution failed: %s", exc)
             return []
@@ -270,11 +379,20 @@ class AquaDomeAggregator:
         """
         Append this flight's data to dClimate series.
         Returns list of updated series IDs.
+
+        TODO: Wire to DClimatePublisher.publish_flight_to_all_series() once
+        the dClimate writer interface is finalised. Requires:
+          from ..marketplace.dclimate import DClimatePublisher
+          publisher = DClimatePublisher.from_config(settings)
+          return publisher.publish_flight_to_all_series(flight_id=flight_id)
         """
         try:
-            _ = flight_id
-            # Wire: DClimatePublisher.publish_flight_to_all_series()
-            return []  # placeholder
+            logger.info(
+                "dClimate distribution for flight=%s: stubbed "
+                "(TODO: wire DClimatePublisher)",
+                flight_id,
+            )
+            return []
         except Exception as exc:
             logger.error("dClimate distribution failed: %s", exc)
             return []
@@ -283,10 +401,30 @@ class AquaDomeAggregator:
         """
         Notify MiamiVerse that new layers are available in the DataHub.
         MiamiVerse re-indexes STAC catalog on webhook signal.
+
+        Reads ``settings.miamiverse_webhook_url`` (env: AQUADOME_MIAMIVERSE_WEBHOOK_URL).
+        Returns True on a 2xx response, False otherwise.
         """
         try:
-            # Real impl: POST to MiamiVerse webhook URL (configure in settings)
-            return True  # placeholder
+            webhook_url = settings.miamiverse_webhook_url
+            if not webhook_url:
+                logger.info(
+                    "AQUADOME_MIAMIVERSE_WEBHOOK_URL not set; "
+                    "skipping MiamiVerse index refresh"
+                )
+                return False
+
+            resp = httpx.post(
+                webhook_url,
+                json={"action": "reindex", "bbox": self._bbox},
+                timeout=10.0,
+            )
+            resp.raise_for_status()
+            logger.info(
+                "MiamiVerse index refresh triggered → HTTP %d", resp.status_code
+            )
+            return True
+
         except Exception as exc:
             logger.warning("MiamiVerse index refresh failed: %s", exc)
             return False

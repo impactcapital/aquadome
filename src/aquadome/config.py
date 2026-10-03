@@ -44,6 +44,9 @@ class Settings(BaseSettings):
     api_port: int = 8000
     api_secret_key: str = "change-me-in-production"
 
+    # MiamiVerse integration
+    miamiverse_webhook_url: str | None = None  # POST on new DataHub layers
+
     @field_validator("detector_model")
     @classmethod
     def _valid_detector(cls, v: str) -> str:
